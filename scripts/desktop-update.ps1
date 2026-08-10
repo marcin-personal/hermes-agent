@@ -239,9 +239,11 @@ function Start-DesktopRelaunch {
 }
 
 function Invoke-StreamedHermes([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
-    # Start-Process + output file + poll keeps the WinForms window pumping
-    # during long silent stretches (pip installs); a blocking pipeline would
-    # freeze the marquee. Returns @{ Code; Output }.
+    # Polling the direct child keeps WinForms pumping during long silent
+    # stretches. Drain both streams asynchronously: descendants can inherit
+    # redirected handles on Windows, so EOF is not a valid completion signal
+    # and stderr must not be allowed to fill while stdout is being read.
+    # Returns @{ Code; Output }.
     $outFile = Join-Path $env:TEMP ("hermes-handoff-{0}-{1}.out" -f $Tag, $PID)
     $errFile = Join-Path $env:TEMP ("hermes-handoff-{0}-{1}.err" -f $Tag, $PID)
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
@@ -265,40 +267,88 @@ function Invoke-StreamedHermes([string]$Exe, [string[]]$HermesArgs, [string]$Tag
     $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $psi.EnvironmentVariables["PYTHONUTF8"] = "1"
     $psi.CreateNoWindow = $true
-    $proc = [System.Diagnostics.Process]::Start($psi)
     $outWriter = [System.IO.File]::CreateText($outFile)
     $errWriter = [System.IO.File]::CreateText($errFile)
-    # Pump synchronously in small reads so the UI stays alive; stderr is
-    # drained at the end (hermes update is stdout-dominant).
-    while (-not $proc.HasExited) {
-        while (-not $proc.StandardOutput.EndOfStream) {
-            $ln = $proc.StandardOutput.ReadLine()
-            if ($null -ne $ln) {
-                $outWriter.WriteLine($ln)
-                if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
-            }
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $started = $false
+    $state = $null
+    $canDispose = $false
+    try {
+        $started = $proc.Start()
+        if (-not $started) { throw "Could not start $Exe" }
+        $state = @{
+            OutEof = $false
+            ErrEof = $false
+            OutTask = $proc.StandardOutput.ReadLineAsync()
+            ErrTask = $proc.StandardError.ReadLineAsync()
+        }
+
+        # ReadLineAsync avoids PowerShell event callbacks (which run without a
+        # reliable runspace under PS 5.1). The state object is shared with this
+        # polling block so task replacements survive each invocation.
+        $drainReadyLines = {
+            do {
+                $madeProgress = $false
+                if (-not $state.OutEof -and $state.OutTask.IsCompleted) {
+                    try { $ln = $state.OutTask.GetAwaiter().GetResult() }
+                    catch { $ln = $null }
+                    if ($null -eq $ln) {
+                        $state.OutEof = $true
+                    } else {
+                        $outWriter.WriteLine($ln)
+                        if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
+                        $state.OutTask = $proc.StandardOutput.ReadLineAsync()
+                    }
+                    $madeProgress = $true
+                }
+                if (-not $state.ErrEof -and $state.ErrTask.IsCompleted) {
+                    try { $ln = $state.ErrTask.GetAwaiter().GetResult() }
+                    catch { $ln = $null }
+                    if ($null -eq $ln) {
+                        $state.ErrEof = $true
+                    } else {
+                        $errWriter.WriteLine($ln)
+                        if ($ln.Trim()) { Write-HandoffLog ("{0}!| {1}" -f $Tag, $ln) }
+                        $state.ErrTask = $proc.StandardError.ReadLineAsync()
+                    }
+                    $madeProgress = $true
+                }
+            } while ($madeProgress)
+        }
+
+        while (-not $proc.HasExited) {
+            & $drainReadyLines
+            if (-not $proc.HasExited) { $proc.WaitForExit(25) | Out-Null }
             if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
         }
-        Start-Sleep -Milliseconds 150
-        if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
+        $code = $proc.ExitCode
+
+        # Child exit is authoritative. A gateway/npm descendant may keep the
+        # pipe handles open forever (#51127/#51216), so accept only a short
+        # grace period for callbacks already in flight. Do not call ReadToEnd,
+        # EndOfStream, or parameterless WaitForExit here; each can wait for EOF.
+        $drainDeadline = (Get-Date).AddMilliseconds(300)
+        do {
+            & $drainReadyLines
+            if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
+            if ($state.OutEof -and $state.ErrEof) { break }
+            Start-Sleep -Milliseconds 25
+        } while ((Get-Date) -lt $drainDeadline)
+        & $drainReadyLines
+        $canDispose = $state.OutEof -and $state.ErrEof
+    } finally {
+        $outWriter.Close()
+        $errWriter.Close()
+        # Do not close/dispose a Windows stream while ReadLineAsync is still
+        # pending. The close can serialize behind that blocked read and wait
+        # for the descendant-held handle (#67373). This hand-off exits shortly;
+        # the background read is harmless and dies with this PowerShell host.
+        if (-not $started -or $canDispose) { $proc.Dispose() }
     }
-    while (-not $proc.StandardOutput.EndOfStream) {
-        $ln = $proc.StandardOutput.ReadLine()
-        if ($null -ne $ln) {
-            $outWriter.WriteLine($ln)
-            if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
-        }
-    }
-    $errText = $proc.StandardError.ReadToEnd()
-    if ($errText) {
-        $errWriter.Write($errText)
-        foreach ($ln in ($errText -split "`r?`n")) {
-            if ($ln.Trim()) { Write-HandoffLog ("{0}!| {1}" -f $Tag, $ln) }
-        }
-    }
-    $outWriter.Close(); $errWriter.Close()
-    $proc.WaitForExit()
-    $code = $proc.ExitCode
+
+    $errText = ""
+    try { $errText = [System.IO.File]::ReadAllText($errFile) } catch {}
     $all = ""
     try { $all = [System.IO.File]::ReadAllText($outFile) } catch {}
     if ($errText) { $all += "`n" + $errText }
