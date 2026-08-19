@@ -522,53 +522,7 @@ function Start-DesktopRelaunch {
     return $spawned
 }
 
-function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
-    # The window shows nothing live, so no line-pump: both pipes drain
-    # asynchronously (no deadlock however chatty the child) while a small
-    # DoEvents loop keeps the marquee animating through long silent
-    # stretches (pip installs) -- the old EndOfStream pump blocked on quiet
-    # children and froze it. Full output still lands in the hand-off log
-    # afterwards, where `hermes debug share` picks it up.
-    # System.Diagnostics.Process directly: Start-Process's .ExitCode is
-    # unreliably $null under PS 5.1 even with the Handle-touch workaround.
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Exe
-    # .Arguments string (PS 5.1 / .NET Framework has no ArgumentList).
-    # Args here are fixed flags + a branch ref; quote each defensively.
-    $psi.Arguments = ($HermesArgs | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') }) -join ' '
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    # hermes update prints UTF-8 (checkmarks, arrows, box glyphs). PS 5.1
-    # defaults these readers to the OEM codepage, which mangles every
-    # multi-byte glyph into mojibake in the log.
-    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-    # And ask the child to actually EMIT UTF-8: Python decides its stdio
-    # encoding from the console codepage when attached to one.
-    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
-    $psi.EnvironmentVariables["PYTHONUTF8"] = "1"
-    $psi.CreateNoWindow = $true
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    while (-not $proc.HasExited) {
-        Start-Sleep -Milliseconds 150
-        if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
-    }
-    $proc.WaitForExit()
-    $outText = $outTask.Result
-    $errText = $errTask.Result
-    foreach ($ln in ($outText -split "`r?`n")) {
-        if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
-    }
-    foreach ($ln in ($errText -split "`r?`n")) {
-        if ($ln.Trim()) { Write-HandoffLog ("{0}!| {1}" -f $Tag, $ln) }
-    }
-    $all = $outText
-    if ($errText) { $all += "`n" + $errText }
-    return @{ Code = $proc.ExitCode; Output = $all }
-}
+. (Join-Path $PSScriptRoot "invoke-hermes-step.ps1")
 
 $finalCode = 1
 $finalMsg = "update did not complete"

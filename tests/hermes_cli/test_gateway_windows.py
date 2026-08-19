@@ -197,6 +197,9 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert calls[1][0] == "/Create"
     assert "/XML" in calls[1]
     assert "/SC" not in calls[1]
+    assert "/IT" in calls[1]
+    assert "<BootTrigger>" not in xml_seen["text"]
+    assert "<LogonType>InteractiveToken</LogonType>" in xml_seen["text"]
     assert "<Delay>PT30S</Delay>" in xml_seen["text"]
     assert "<StartWhenAvailable>true</StartWhenAvailable>" in xml_seen["text"]
     assert "<StopOnIdleEnd>false</StopOnIdleEnd>" in xml_seen["text"]
@@ -211,6 +214,55 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "//B //Nologo" in xml_seen["text"]
     assert "Hermes_Gateway_alice.vbs" in xml_seen["text"]
     assert "cmd.exe" not in xml_seen["text"]
+
+
+def test_non_admin_install_attempts_user_task_before_uac_or_startup_fallback(
+    monkeypatch, tmp_path, capsys
+):
+    """A normal user can create an InteractiveToken task without elevation.
+
+    The installer must try that reliable Task Scheduler path before asking for
+    UAC or dropping to the less observable Startup-folder fallback.
+    """
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda *args, **kwargs: (False, True),
+    )
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_scheduled_task",
+        lambda task_name, path: calls.append(("scheduled_task", task_name, path))
+        or (True, "Created Scheduled Task 'Hermes_Gateway'"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_launch_elevated_install",
+        lambda **kwargs: pytest.fail("successful user task must not request elevation"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_startup_entry",
+        lambda path: pytest.fail("successful user task must not install Startup fallback"),
+    )
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
+    monkeypatch.setattr(
+        setup,
+        "prompt_yes_no",
+        lambda *args, **kwargs: pytest.fail("successful user task must not prompt for UAC"),
+    )
+
+    gateway_windows.install(start_now=False, start_on_login=True)
+
+    assert calls == [("scheduled_task", "Hermes_Gateway", script_path)]
+    assert "Gateway auto-start installed for Windows login" in capsys.readouterr().out
 
 
 def test_gateway_vbs_script_is_console_less(monkeypatch):

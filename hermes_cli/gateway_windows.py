@@ -1068,29 +1068,6 @@ def install(
     task_name = get_task_name()
     script_path = _write_task_script()
 
-    # On machines where the current user's scheduled-task ACL is locked down,
-    # schtasks /Create or /Change can sit for the timeout before returning
-    # Access Denied. We already collected all intent questions above, so avoid
-    # a mysterious post-question pause: ask for UAC before touching schtasks.
-    if not _is_running_as_admin() and not elevated_handoff:
-        from hermes_cli.setup import prompt_yes_no
-
-        print("↻ Scheduled Task install may need administrator approval on this Windows account.")
-        print("  UAC is Windows' admin approval prompt; it is needed to create/update the Scheduled Task.")
-        if prompt_yes_no("  Open the UAC prompt now?", False):
-            if _launch_elevated_install(force=force, start_now=start_now, start_on_login=start_on_login):
-                print("✓ Launched elevated Hermes gateway install prompt.")
-                if start_now:
-                    print("  Approve the Windows UAC prompt; the elevated install will start the gateway afterwards.")
-                else:
-                    print("  Approve the Windows UAC prompt, then run: hermes gateway status")
-                return
-            print("⚠ Falling back to Startup folder because elevation was unavailable or cancelled.")
-        else:
-            print("  Skipped elevation. Falling back to Startup folder.")
-        _install_startup_fallback(script_path, start_now, "administrator approval was not used")
-        return
-
     ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
         print(f"✓ {detail}")
