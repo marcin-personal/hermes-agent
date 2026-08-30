@@ -1,5 +1,7 @@
 """Cross-profile gateway restart environment isolation."""
 
+import json
+
 from pathlib import Path
 
 import pytest
@@ -113,6 +115,48 @@ def test_profile_restart_passes_isolated_env_to_watcher(monkeypatch):
 
     assert len(popen_calls) == 1
     assert popen_calls[0][1]["env"] is isolated_env
+
+
+def test_windows_profile_restart_inner_spawn_keeps_target_home(monkeypatch):
+    target_env = {
+        "PATH": "safe-path",
+        "HERMES_HOME": r"D:\Hermes Homes\target",
+    }
+    popen_calls = []
+
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    monkeypatch.setattr(
+        "hermes_cli.gateway_windows.windowless_gateway_restart_spec",
+        lambda argv: (
+            argv,
+            "stable-cwd",
+            {
+                "HERMES_HOME": r"C:\Hermes Homes\source",
+                "VIRTUAL_ENV": "stable-venv",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+
+    assert gateway._spawn_gateway_restart_watcher(
+        1234,
+        ["python", "-m", "hermes_cli.main", "gateway", "run"],
+        watcher_env=target_env,
+    )
+
+    watcher_argv = popen_calls[0][0][0]
+    watcher_source = watcher_argv[2]
+    overlay_line = next(
+        line
+        for line in watcher_source.splitlines()
+        if line.strip().startswith("_respawn_env_overlay =")
+    )
+    overlay = json.loads(overlay_line.split("=", 1)[1].strip())
+    assert overlay["HERMES_HOME"] == target_env["HERMES_HOME"]
 
 
 @pytest.mark.parametrize(

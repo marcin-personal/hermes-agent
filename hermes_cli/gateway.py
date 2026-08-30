@@ -1039,6 +1039,12 @@ def _spawn_gateway_restart_watcher(
             run_argv, respawn_cwd, respawn_env_overlay = (
                 windowless_gateway_restart_spec(list(run_argv))
             )
+            # The Windows spec is built in the updater process, so its
+            # HERMES_HOME reflects the source profile.  Profile restarts give
+            # the watcher an isolated target environment; keep that identity
+            # authoritative for the inner gateway spawn as well.
+            if watcher_env is not None and watcher_env.get("HERMES_HOME"):
+                respawn_env_overlay["HERMES_HOME"] = watcher_env["HERMES_HOME"]
         except Exception:
             # Best-effort: if the rewrite fails for any reason, fall back to
             # the original argv.  A visible window is worse than nothing, but
